@@ -2,7 +2,10 @@ import {errorUtils} from '@verdaccio/core';
 import type {searchUtils} from '@verdaccio/core';
 import type {Callback, Config, Logger, Token, TokenFilter} from '@verdaccio/types';
 
-import type {GoogleCloudConfig} from '../types';
+import type {GoogleCloudConfig, PostgresConfig} from '../types';
+import DatastoreBackend, {DEFAULT_KIND} from './backends/datastore';
+import PostgresBackend from './backends/postgres';
+import type {PackageLocker, RegistryBackend} from './backends/types';
 import setConfigValue from './setConfigValue';
 import GoogleCloudStorageHandler from './storage';
 import type {IStorageHelper} from './storage-helper';
@@ -10,21 +13,21 @@ import StorageHelper from './storage-helper';
 
 import type {DatastoreOptions} from '@google-cloud/datastore';
 import {Datastore} from '@google-cloud/datastore';
-import type {entity} from '@google-cloud/datastore/build/src/entity';
-import type {RunQueryResponse} from '@google-cloud/datastore/build/src/query';
 import type {StorageOptions} from '@google-cloud/storage';
 import {Storage} from '@google-cloud/storage';
 import debugCore from 'debug';
 
-type Key = entity.Key;
-
 const debug = debugCore('verdaccio:plugin:google-cloud');
+
+// backend errors can carry hosts and role names; clients get this, the log gets the details
+const DATABASE_ERROR = 'registry database error';
 
 export const ERROR_MISSING_CONFIG =
   'google cloud storage missing config. Add `store.google-cloud` to your config file';
 
 export default class GoogleCloudDatabase {
   private helper: IStorageHelper;
+  private backend: RegistryBackend;
   public logger: Logger;
   public config: GoogleCloudConfig;
   private kind: string;
@@ -48,34 +51,76 @@ export default class GoogleCloudDatabase {
     this.config.apiEndpoint = setConfigValue(this.config.apiEndpoint);
     this.config.datastoreEndpoint = setConfigValue(this.config.datastoreEndpoint);
 
-    this.kind = this.config.kind || 'VerdaccioDataStore';
+    this.kind = this.config.kind || DEFAULT_KIND;
 
     if (!this.config.bucket) {
       throw new Error('Google Cloud Storage requires a bucket name, please define one.');
     }
     this.bucketName = this.config.bucket;
 
-    const {datastore, storage} = this._createClients();
-    this.helper = new StorageHelper(datastore, storage, this.config);
+    this.helper = new StorageHelper(new Storage(this._getStorageOptions()), this.config);
+    this.backend = this._createBackend();
 
+    const database = this.config.database ?? 'datastore';
     debug(
-      'initialized bucket=%o projectId=%o kind=%o',
+      'initialized bucket=%o projectId=%o database=%o kind=%o',
       this.bucketName,
       this.config.projectId,
+      database,
       this.kind
     );
     this.logger.trace(
-      {bucket: this.bucketName, projectId: this.config.projectId, kind: this.kind},
-      'google-cloud: plugin initialized bucket=@{bucket} projectId=@{projectId} kind=@{kind}'
+      {bucket: this.bucketName, projectId: this.config.projectId, database, kind: this.kind},
+      'google-cloud: plugin initialized bucket=@{bucket} projectId=@{projectId} database=@{database} kind=@{kind}'
     );
   }
 
   public async init(): Promise<void> {
     debug('init: verifying connectivity');
     this.logger.trace('google-cloud: [init] verifying connectivity');
-    await this.getSecret();
+    await this.backend.init();
     debug('init: connectivity verified');
     this.logger.trace('google-cloud: [init] connectivity verified');
+  }
+
+  public async close(): Promise<void> {
+    await this.backend.close?.();
+  }
+
+  private _createBackend(): RegistryBackend {
+    const database = this.config.database ?? 'datastore';
+    switch (database) {
+      case 'datastore':
+        return new DatastoreBackend(
+          new Datastore(this._getGoogleOptions()),
+          this.kind,
+          this.logger
+        );
+      case 'postgres':
+        return new PostgresBackend(this._resolvePostgresConfig(), this.logger);
+      default:
+        throw new Error(
+          `google-cloud: unknown database ${JSON.stringify(database)}, expected "datastore" or "postgres"`
+        );
+    }
+  }
+
+  private _resolvePostgresConfig(): PostgresConfig {
+    const raw = this.config.postgres ?? {};
+    const resolved: PostgresConfig = {...raw};
+    // same env-var-name indirection as the other options, so secrets stay out of config.yaml
+    resolved.connectionString = setConfigValue(raw.connectionString, true);
+    resolved.host = setConfigValue(raw.host);
+    resolved.database = setConfigValue(raw.database);
+    resolved.user = setConfigValue(raw.user);
+    resolved.password = setConfigValue(raw.password, true);
+    if (raw.port !== undefined) {
+      resolved.port = Number(setConfigValue(raw.port));
+      if (!Number.isInteger(resolved.port) || resolved.port <= 0) {
+        throw new Error('google-cloud: postgres.port must resolve to a positive integer');
+      }
+    }
+    return resolved;
   }
 
   private _getGoogleOptions(): DatastoreOptions {
@@ -148,14 +193,14 @@ export default class GoogleCloudDatabase {
       debug('search (callback)');
       void (async (): Promise<void> => {
         try {
-          const entities = await this.helper.getEntities(this.kind);
+          const names = await this.backend.listPackages();
           const selected = validateName
-            ? entities.filter((item): boolean => validateName(item.name))
-            : entities;
-          debug('search (callback) emitting %d of %d packages', selected.length, entities.length);
-          for (const item of selected) {
+            ? names.filter((name): boolean => validateName(name))
+            : names;
+          debug('search (callback) emitting %d of %d packages', selected.length, names.length);
+          for (const name of selected) {
             await new Promise<void>((resolve): void => {
-              onPackage(this.toSearchItem(item.name), resolve);
+              onPackage(this.toSearchItem(name), resolve);
             });
           }
           onEnd();
@@ -173,194 +218,77 @@ export default class GoogleCloudDatabase {
     const text = (query.text ?? query.query?.text)?.toLowerCase();
     debug('search (promise) text=%o', text);
     return (async (): Promise<searchUtils.SearchItem[]> => {
-      const entities = await this.helper.getEntities(this.kind);
+      const names = await this.backend.listPackages();
       const matched = text
-        ? entities.filter((item): boolean => item.name.toLowerCase().includes(text))
-        : entities;
-      debug('search (promise) matched %d of %d', matched.length, entities.length);
-      return matched.map((item): searchUtils.SearchItem => this.toSearchItem(item.name));
+        ? names.filter((name): boolean => name.toLowerCase().includes(text))
+        : names;
+      debug('search (promise) matched %d of %d', matched.length, names.length);
+      return matched.map((name): searchUtils.SearchItem => this.toSearchItem(name));
     })();
   }
 
   public async saveToken(token: Token): Promise<void> {
-    debug('saveToken user=%o key=%o', token.user, token.key);
-    this.logger.trace(
-      {user: token.user, tokenKey: token.key},
-      'google-cloud: [saveToken] saving token for user=@{user} key=@{tokenKey}'
-    );
-    const datastore = this.helper.datastore;
-    const key = datastore.key(['Token', `${token.user}:${token.key}`]);
-    await datastore.upsert({
-      key,
-      data: {
-        user: token.user,
-        key: token.key,
-        token: token.token,
-        readonly: token.readonly,
-        created: token.created,
-      },
-    });
-    debug('saveToken user=%o key=%o stored', token.user, token.key);
-    this.logger.trace(
-      {user: token.user, tokenKey: token.key},
-      'google-cloud: [saveToken] stored user=@{user} key=@{tokenKey}'
-    );
+    await this.backend.saveToken(token);
   }
 
   public async deleteToken(user: string, tokenKey: string): Promise<void> {
-    debug('deleteToken user=%o key=%o', user, tokenKey);
-    this.logger.trace(
-      {user, tokenKey},
-      'google-cloud: [deleteToken] deleting token user=@{user} key=@{tokenKey}'
-    );
-    const datastore = this.helper.datastore;
-    const key = datastore.key(['Token', `${user}:${tokenKey}`]);
-    await datastore.delete(key);
-    debug('deleteToken user=%o key=%o deleted', user, tokenKey);
-    this.logger.trace(
-      {user, tokenKey},
-      'google-cloud: [deleteToken] deleted user=@{user} key=@{tokenKey}'
-    );
+    await this.backend.deleteToken(user, tokenKey);
   }
 
   public async readTokens(filter: TokenFilter): Promise<Token[]> {
-    debug('readTokens user=%o', filter.user);
-    this.logger.trace(
-      {user: filter.user},
-      'google-cloud: [readTokens] querying tokens for user=@{user}'
-    );
-    const datastore = this.helper.datastore;
-    const query = datastore.createQuery('Token').filter('user', filter.user);
-    const [entities] = await datastore.runQuery(query);
-
-    const tokens: Token[] = entities.map((entity: any) => ({
-      user: entity.user as string,
-      key: entity.key as string,
-      token: entity.token as string,
-      readonly: entity.readonly as boolean,
-      created: entity.created as string,
-    }));
-    debug('readTokens user=%o found=%d', filter.user, tokens.length);
-    this.logger.trace(
-      {user: filter.user, count: tokens.length},
-      'google-cloud: [readTokens] found @{count} tokens for user=@{user}'
-    );
-    return tokens;
+    return this.backend.readTokens(filter);
   }
 
   public async getSecret(): Promise<string> {
-    const key: Key = this.helper.datastore.key(['Secret', 'secret']);
-    debug('getSecret');
-    this.logger.trace('google-cloud: [datastore getSecret] init');
-
-    try {
-      const data = await this.helper.datastore.get(key);
-      const entities = data[0];
-      debug('getSecret found=%o', !!entities);
-      this.logger.trace({data}, 'google-cloud: [datastore getSecret] response @{data}');
-      if (!entities) {
-        return '';
-      }
-      return entities.secret;
-    } catch (err) {
-      debug('getSecret failed: %o', err);
-      this.logger.trace({err}, 'google-cloud: [getSecret] error, returning empty secret');
-      return '';
-    }
+    return this.backend.getSecret();
   }
 
   public async setSecret(secret: string): Promise<void> {
-    const key = this.helper.datastore.key(['Secret', 'secret']);
-    const entity = {
-      key,
-      data: {secret},
-    };
-    debug('setSecret');
-    this.logger.trace('google-cloud: [datastore setSecret] added');
-    await this.helper.datastore.upsert(entity);
+    await this.backend.setSecret(secret);
   }
 
   public add(name: string, cb: Callback): void {
-    const datastore = this.helper.datastore;
-    const key = datastore.key([this.kind, name]);
-    const data = {name};
-    debug('add package=%o', name);
-    this.logger.trace({name}, 'google-cloud: [datastore add] @{name} init');
-
-    void (async (): Promise<void> => {
-      try {
-        await datastore.save({key, data});
-        debug('add package=%o success', name);
-        this.logger.trace({name}, 'google-cloud: [datastore add] @{name} has been added');
-        cb(null);
-      } catch (err: any) {
+    this.backend.addPackage(name).then(
+      (): void => cb(null),
+      (err: any): void => {
         debug('add package=%o failed: %o', name, err);
-        this.logger.trace(
-          {name, err: err.message},
-          'google-cloud: [datastore add] @{name} error @{err}'
-        );
-        cb(errorUtils.getInternalError(err.message));
+        this.logger.error({name, err: err.message}, 'google-cloud: [add] @{name} error @{err}');
+        cb(errorUtils.getInternalError(DATABASE_ERROR));
       }
-    })();
+    );
   }
 
   public remove(name: string, cb: Callback): void {
-    debug('remove package=%o', name);
-    this.logger.trace({name}, 'google-cloud: [datastore remove] @{name} init');
-
-    void (async (): Promise<void> => {
-      try {
-        const entities = await this.helper.getEntities(this.kind);
-        for (const item of entities) {
-          if (item.name === name) {
-            await this.helper.datastore.delete(item.key);
-          }
-        }
-        debug('remove package=%o success', name);
-        cb(null);
-      } catch (err: any) {
+    this.backend.removePackage(name).then(
+      (): void => cb(null),
+      (err: any): void => {
         debug('remove package=%o failed: %o', name, err);
-        cb(errorUtils.getInternalError(err.message));
+        this.logger.error({name, err: err.message}, 'google-cloud: [remove] @{name} error @{err}');
+        cb(errorUtils.getInternalError(DATABASE_ERROR));
       }
-    })();
+    );
   }
 
   public get(cb: Callback): void {
-    debug('get all packages');
-    this.logger.trace('google-cloud: [datastore get] init');
-
-    void (async (): Promise<void> => {
-      try {
-        const query = this.helper.datastore.createQuery(this.kind);
-        const data: RunQueryResponse = await this.helper.runQuery(query);
-        const response: object[] = data[0];
-
-        const names = response.reduce((accumulator: string[], task: any): string[] => {
-          accumulator.push(task.name);
-          return accumulator;
-        }, []);
-
-        debug('get packages count=%d', names.length);
-        this.logger.trace({names}, 'google-cloud: [datastore get] names @{names}');
-        cb(null, names);
-      } catch (err: any) {
+    this.backend.listPackages().then(
+      (names: string[]): void => cb(null, names),
+      (err: any): void => {
         debug('get packages failed: %o', err);
-        cb(errorUtils.getInternalError(err.message));
+        this.logger.error({err: err.message}, 'google-cloud: [get] error @{err}');
+        cb(errorUtils.getInternalError(DATABASE_ERROR));
       }
-    })();
+    );
   }
 
   public getPackageStorage(packageInfo: string): GoogleCloudStorageHandler {
-    const {helper, config, logger} = this;
+    const {helper, config, logger, backend} = this;
     debug('getPackageStorage package=%o', packageInfo);
-    return new GoogleCloudStorageHandler(packageInfo, helper, config, logger);
-  }
-
-  private _createClients(): {datastore: Datastore; storage: Storage} {
-    const datastoreOptions = this._getGoogleOptions();
-    const storageOptions = this._getStorageOptions();
-    const datastore = new Datastore(datastoreOptions);
-    const storage = new Storage(storageOptions);
-    return {datastore, storage};
+    return new GoogleCloudStorageHandler(
+      packageInfo,
+      helper,
+      config,
+      logger,
+      backend.withPackageLock ? (backend as PackageLocker) : undefined
+    );
   }
 }

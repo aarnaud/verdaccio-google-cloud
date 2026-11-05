@@ -32,6 +32,7 @@ export default defineConfig({
         // Other deps
         'debug',
         'http-errors',
+        'pg',
       ],
     },
     outDir: 'lib',

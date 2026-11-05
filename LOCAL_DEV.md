@@ -38,9 +38,14 @@ pnpm format
 ```
 src/
   index.ts              # barrel export
-  data-storage.ts       # registry database (Cloud Datastore)
+  data-storage.ts       # registry database facade, picks the backend
+  backends/
+    types.ts            # RegistryBackend interface
+    datastore.ts        # Cloud Datastore backend (default)
+    postgres.ts         # PostgreSQL backend + per-package advisory lock
   storage.ts            # package storage (Google Cloud Storage)
-  storage-helper.ts     # GCS/Datastore helper utilities
+  storage-helper.ts     # GCS helper utilities
+sql/schema.sql          # PostgreSQL tables, for migrate: false
 types/
   index.ts              # GoogleCloudConfig interface
 tests/                  # unit tests (vitest 4)
@@ -64,6 +69,25 @@ docker compose up -d --build
 
 # Verdaccio will be available at http://localhost:4873
 ```
+
+### With PostgreSQL instead of the Datastore emulator
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.postgres.yaml up -d --build
+```
+
+This starts `postgres` (17) in place of the Datastore emulator and runs Verdaccio with
+[`conf/config.postgres.yaml`](conf/config.postgres.yaml) (`database: postgres`, connection string
+from `DATABASE_URL`). Inspect it with
+`docker compose exec postgres psql -U verdaccio -d verdaccio -c '\dt'`.
+
+The PostgreSQL integration tests are skipped unless you point them at a database:
+
+```bash
+TEST_POSTGRES_URL=postgres://verdaccio:verdaccio@localhost:5432/verdaccio pnpm test
+```
+
+They create and drop their own schema and roles, so use a scratch database and a role that may `CREATE ROLE` and `CREATE` on it.
 
 ### What happens on startup
 

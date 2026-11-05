@@ -30,10 +30,6 @@ const createMockHelper = (fileExists = false): IStorageHelper => {
   };
 
   return {
-    datastore: {} as any,
-    createQuery: vi.fn(),
-    runQuery: vi.fn(),
-    getEntities: vi.fn(),
     getBucket: vi.fn().mockReturnValue({
       file: vi.fn().mockReturnValue(mockFile),
     }),
@@ -183,6 +179,118 @@ describe('GoogleCloudStorageHandler', () => {
 
       expect(errors).toHaveLength(1);
       expect(errors[0].code).toBe(404);
+    });
+  });
+
+  describe('writeTarball', () => {
+    // Regression: verdaccio calls done() synchronously after writeTarball returns, before the
+    // async existence check finishes. A missing done() made every publish answer 500.
+    test('done() and abort() exist synchronously and done() still reports success', async () => {
+      const fileStream = new PassThrough();
+      const helper = createMockHelper(false);
+      (helper.getBucket as any).mockReturnValue({
+        file: vi.fn().mockReturnValue({
+          name: 'test-pkg/a.tgz',
+          exists: vi.fn().mockResolvedValue([false]),
+          createWriteStream: vi.fn().mockReturnValue(fileStream),
+        }),
+      });
+      (helper.buildFilePath as any).mockReturnValue({exists: vi.fn().mockResolvedValue([false])});
+      const store = new GoogleCloudStorageHandler('test-pkg', helper, config, logger);
+
+      const upload = store.writeTarball('a.tgz');
+      expect(typeof upload.done).toBe('function');
+      expect(typeof upload.abort).toBe('function');
+
+      const success = new Promise<void>((resolve) => upload.on('success', () => resolve()));
+      upload.write('data');
+      upload.end();
+      upload.done!();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      fileStream.emit('response', {statusCode: 200});
+      await success;
+    });
+  });
+
+  describe('updatePackage with a package locker', () => {
+    const run = (store: GoogleCloudStorageHandler): Promise<any[]> =>
+      new Promise((resolve) => {
+        store.updatePackage(
+          'test-pkg',
+          (_meta: any, cb: any) => cb(null),
+          (_name: string, _pkg: any, cb: any) => cb(null),
+          (pkg: any) => pkg,
+          (...args: any[]) => resolve(args)
+        );
+      });
+
+    test('runs inside the lock and reports only after the lock is released', async () => {
+      const events: string[] = [];
+      const locker = {
+        withPackageLock: vi.fn(async (_name: string, fn: () => Promise<any>) => {
+          events.push('locked');
+          const result = await fn();
+          events.push('released');
+          return result;
+        }),
+      };
+      const store = new GoogleCloudStorageHandler(
+        'test-pkg',
+        createMockHelper(),
+        config,
+        logger,
+        locker
+      );
+
+      const [err] = await run(store);
+      events.push('end');
+
+      expect(err).toBeNull();
+      expect(locker.withPackageLock).toHaveBeenCalledWith('test-pkg', expect.any(Function));
+      expect(events).toEqual(['locked', 'released', 'end']);
+    });
+
+    test('hides database details from the client when the lock cannot be taken', async () => {
+      const locker = {
+        withPackageLock: vi.fn().mockRejectedValue(new Error('connect ECONNREFUSED 10.1.2.3:5432')),
+      };
+      const store = new GoogleCloudStorageHandler(
+        'test-pkg',
+        createMockHelper(),
+        config,
+        logger,
+        locker
+      );
+
+      const [err] = await run(store);
+
+      expect(err.code).toBe(500);
+      expect(err.message).toBe('registry database unavailable');
+      expect(JSON.stringify((logger.error as any).mock.calls)).toContain('ECONNREFUSED');
+    });
+
+    test('answers 503 when waiting for the lock timed out', async () => {
+      const timeout = Object.assign(new Error('timed out after 30000ms waiting for pkg'), {
+        name: 'PackageLockTimeoutError',
+      });
+      const locker = {withPackageLock: vi.fn().mockRejectedValue(timeout)};
+      const store = new GoogleCloudStorageHandler(
+        'test-pkg',
+        createMockHelper(),
+        config,
+        logger,
+        locker
+      );
+
+      const [err] = await run(store);
+
+      expect(err.code).toBe(503);
+    });
+
+    test('without a locker the update runs directly', async () => {
+      const store = new GoogleCloudStorageHandler('test-pkg', createMockHelper(), config, logger);
+      const [err] = await run(store);
+      expect(err).toBeNull();
     });
   });
 });

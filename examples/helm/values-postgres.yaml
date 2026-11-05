@@ -1,0 +1,145 @@
+# Verdaccio Helm chart values: high availability with GCS + PostgreSQL (e.g. Cloud SQL), no Datastore.
+# Chart: https://github.com/verdaccio/charts
+#
+# What is shared between replicas: tarballs and package metadata in GCS, registry state in
+# PostgreSQL. Concurrent publishes of one package on different replicas are serialised by a
+# PostgreSQL advisory lock, so no version is lost.
+#
+# NOT shared: the default htpasswd file is per pod. Replace `auth` below with an external
+# provider (LDAP, OIDC, GitHub, ...) before running more than one replica.
+#
+# Prerequisites:
+#   1. GKE with Workload Identity; a GCP service account with roles/storage.objectAdmin on the
+#      bucket, bound to the Kubernetes service account below
+#   2. A PostgreSQL >= 11 database and role for Verdaccio (Cloud SQL private IP, or Auth Proxy)
+#   3. The image from this repo's Dockerfile pushed to your registry
+#   4. A Secret holding the connection string:
+#        kubectl create secret generic verdaccio-db \
+#          --from-literal=DATABASE_URL='postgres://verdaccio:<password>@<host>:5432/verdaccio?sslmode=verify-full'
+#      node-postgres treats sslmode=require/prefer/verify-ca like verify-full, so the server
+#      certificate is always verified: trust the Cloud SQL server CA via NODE_EXTRA_CA_CERTS,
+#      or, accepting that the peer is not authenticated, use sslmode=no-verify
+#
+#   helm install verdaccio verdaccio/verdaccio -f values-postgres.yaml
+
+replicaCount: 3
+
+image:
+  repository: europe-docker.pkg.dev/YOUR_PROJECT/verdaccio/verdaccio-google-cloud
+  tag: '1.0.0' # pin a version or digest, never latest
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: verdaccio
+  annotations:
+    iam.gke.io/gcp-service-account: verdaccio@YOUR_PROJECT.iam.gserviceaccount.com
+
+extraEnvVars:
+  - name: GCS_BUCKET
+    value: your-verdaccio-bucket
+  - name: GOOGLE_CLOUD_PROJECT
+    value: YOUR_PROJECT
+  - name: DATABASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: verdaccio-db
+        key: DATABASE_URL
+
+configMap: |
+  storage: /verdaccio/storage
+  plugins: /verdaccio/plugins
+  max_body_size: 100mb
+
+  store:
+    google-cloud:
+      bucket: GCS_BUCKET
+      projectId: GOOGLE_CLOUD_PROJECT
+      database: postgres
+      postgres:
+        connectionString: DATABASE_URL
+        # replicas * max must stay below the server's max_connections; a request waiting for a
+        # package lock holds one connection
+        max: 10
+        lockTimeoutMs: 30000
+        # migrate: false  # once sql/schema.sql was applied by an admin and the role is least-privilege
+
+  uplinks:
+    npmjs:
+      url: https://registry.npmjs.org/
+
+  packages:
+    '@*/*':
+      access: $authenticated
+      publish: $authenticated
+      proxy: npmjs
+    '**':
+      access: $authenticated
+      publish: $authenticated
+      proxy: npmjs
+
+  log:
+    - type: stdout
+      format: json
+      level: http
+
+  listen:
+    - 0.0.0.0:4873
+
+  # Replace for HA: htpasswd lives in each pod's local /verdaccio/storage.
+  auth:
+    htpasswd:
+      file: /verdaccio/storage/htpasswd
+      max_users: -1
+
+persistence:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+# spread replicas over nodes
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: verdaccio
+
+readinessProbe:
+  httpGet:
+    path: /-/ping
+    port: 4873
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+livenessProbe:
+  httpGet:
+    path: /-/ping
+    port: 4873
+  initialDelaySeconds: 15
+  periodSeconds: 30
+
+# Keep two replicas up during node drains (create separately if your chart version has no value for it):
+#   apiVersion: policy/v1
+#   kind: PodDisruptionBudget
+#   metadata: {name: verdaccio}
+#   spec:
+#     minAvailable: 2
+#     selector: {matchLabels: {app.kubernetes.io/name: verdaccio}}
+#
+# Cloud SQL Auth Proxy sidecar instead of private IP + TLS: add this container to the pod
+# (chart value `extraContainers` or a kustomize patch), set the connection string to
+# postgres://verdaccio:<password>@127.0.0.1:5432/verdaccio and bind the proxy's
+# service account roles/cloudsql.client:
+#   - name: cloud-sql-proxy
+#     image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2
+#     args: ["--private-ip", "--structured-logs", "YOUR_PROJECT:REGION:INSTANCE"]
+#     securityContext: {runAsNonRoot: true}

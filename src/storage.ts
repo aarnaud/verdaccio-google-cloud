@@ -3,6 +3,7 @@ import type {VerdaccioError} from '@verdaccio/core';
 import type {Callback, Logger, Package} from '@verdaccio/types';
 
 import type {GoogleCloudConfig} from '../types';
+import type {PackageLocker} from './backends/types';
 import type {IStorageHelper} from './storage-helper';
 
 import type {File} from '@google-cloud/storage';
@@ -25,14 +26,17 @@ export default class GoogleCloudStorageHandler {
   private key: string;
   private helper: IStorageHelper;
   private name: string;
+  private locker?: PackageLocker;
 
   public constructor(
     name: string,
     helper: IStorageHelper,
     config: GoogleCloudConfig,
-    logger: Logger
+    logger: Logger,
+    locker?: PackageLocker
   ) {
     this.name = name;
+    this.locker = locker;
     this.logger = logger;
     this.helper = helper;
     this.config = config;
@@ -40,6 +44,55 @@ export default class GoogleCloudStorageHandler {
   }
 
   public updatePackage(
+    name: string,
+    updateHandler: Callback,
+    onWrite: Callback,
+    transformPackage: (...args: any[]) => any,
+    onEnd: Callback
+  ): void {
+    const locker = this.locker;
+    if (!locker) {
+      this._updatePackage(name, updateHandler, onWrite, transformPackage, onEnd);
+      return;
+    }
+
+    // read-modify-write of package.json must not interleave with another replica's, or the
+    // last writer silently drops the other's version
+    let finish: (args: any[]) => void = (): void => undefined;
+    const finished = new Promise<any[]>((resolve): void => {
+      finish = resolve;
+    });
+    locker
+      .withPackageLock(name, async (): Promise<any[]> => {
+        this._updatePackage(
+          name,
+          updateHandler,
+          onWrite,
+          transformPackage,
+          (...args: any[]): void => finish(args)
+        );
+        return finished;
+      })
+      .then(
+        (args: any[]): void => {
+          onEnd(...args);
+        },
+        (err: Error): void => {
+          this.logger.error(
+            {name, err: err.message},
+            'gcloud: could not lock @{name} for update err: @{err}'
+          );
+          // pg messages carry hosts and role names, so clients only get a generic message
+          onEnd(
+            err.name === 'PackageLockTimeoutError'
+              ? errorUtils.getServiceUnavailable(err.message)
+              : errorUtils.getInternalError('registry database unavailable')
+          );
+        }
+      );
+  }
+
+  private _updatePackage(
     name: string,
     updateHandler: Callback,
     onWrite: Callback,
@@ -246,6 +299,23 @@ export default class GoogleCloudStorageHandler {
       streamEnded = 1;
     });
 
+    // Verdaccio calls done()/abort() right after writeTarball returns, before the async
+    // existence check below has produced a file stream, so both must exist synchronously.
+    let fileStream: ReturnType<File['createWriteStream']> | undefined;
+    let armSuccess: (() => void) | undefined;
+    let doneCalled = false;
+    uploadStream.done = (): void => {
+      doneCalled = true;
+      armSuccess?.();
+    };
+    uploadStream.abort = (): void => {
+      this.logger.warn(
+        {url: `${this.name}/${name}`},
+        'gcloud: upload stream has been aborted for @{url}'
+      );
+      fileStream?.destroy(undefined);
+    };
+
     try {
       this._fileExist(this.name, name).then(
         (exist: boolean): void => {
@@ -260,12 +330,13 @@ export default class GoogleCloudStorageHandler {
               {url: file.name},
               'gcloud: the @{url} is being uploaded to the storage'
             );
-            const fileStream = file.createWriteStream({
+            fileStream = file.createWriteStream({
               validation: this.config.validation || defaultValidation,
             });
-            uploadStream.done = (): void => {
+            const stream = fileStream;
+            armSuccess = (): void => {
               const onEnd = (): void => {
-                fileStream.on('response', (): void => {
+                stream.on('response', (): void => {
                   debug('writeTarball name=%o success', file.name);
                   this.logger.trace(
                     {url: file.name},
@@ -280,15 +351,16 @@ export default class GoogleCloudStorageHandler {
                 uploadStream.on('end', onEnd);
               }
             };
+            if (doneCalled) armSuccess();
 
-            fileStream._destroy = function (err: Error): void {
+            stream._destroy = function (err: Error): void {
               if (err) {
                 uploadStream.emit('error', errorUtils.getBadRequest(err.message));
-                fileStream.emit('close');
+                stream.emit('close');
               }
             };
 
-            fileStream.on('open', (): void => {
+            stream.on('open', (): void => {
               debug('writeTarball stream open for %o', file.name);
               this.logger.trace(
                 {url: file.name},
@@ -297,21 +369,13 @@ export default class GoogleCloudStorageHandler {
               uploadStream.emit('open');
             });
 
-            fileStream.on('error', (err: Error): void => {
+            stream.on('error', (err: Error): void => {
               this.logger.error({url: file.name}, 'gcloud: upload stream has failed for @{url}');
-              fileStream.end();
+              stream.end();
               uploadStream.emit('error', errorUtils.getBadRequest(err.message));
             });
 
-            uploadStream.abort = (): void => {
-              this.logger.warn(
-                {url: file.name},
-                'gcloud: upload stream has been aborted for @{url}'
-              );
-              fileStream.destroy(undefined);
-            };
-
-            uploadStream.pipe(fileStream);
+            uploadStream.pipe(stream);
             uploadStream.emit('open');
           }
         },

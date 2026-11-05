@@ -12,8 +12,8 @@ Verdaccio delegates all persistence to a storage plugin. This one splits that wo
 two Google Cloud services:
 
 - **Cloud Storage** holds the bytes — every `package.json` and every tarball.
-- **Cloud Datastore** holds the registry state — which packages exist, the registry
-  secret, and auth tokens.
+- **Cloud Datastore** (default) or **PostgreSQL** (`database: postgres`) holds the registry
+  state — which packages exist, the registry secret, and auth tokens.
 
 Nothing is kept on local disk, which is what makes multiple Verdaccio instances able to
 share one registry.
@@ -37,15 +37,19 @@ flowchart TB
     helper --> gcs[("Cloud Storage")]
 ```
 
-`GoogleCloudDatabase` is created once at startup and owns the Datastore and Storage
-clients through `StorageHelper`. It hands out a `GoogleCloudStorageHandler` per package,
-which is where reads and writes of that package's files happen.
+`GoogleCloudDatabase` is created once at startup. It owns the Storage client through
+`StorageHelper` and delegates the registry state to a backend picked by the `database`
+option: `DatastoreBackend` (default) or `PostgresBackend`, both in `src/backends/`. It hands
+out a `GoogleCloudStorageHandler` per package, which is where reads and writes of that
+package's files happen.
 
 | Component                   | Backed by     | Responsibilities                                                                              |
 | --------------------------- | ------------- | --------------------------------------------------------------------------------------------- |
-| `GoogleCloudDatabase`       | Datastore     | package list (`add`, `remove`, `get`), `search`, registry secret, auth tokens                 |
+| `GoogleCloudDatabase`       | a backend     | package list (`add`, `remove`, `get`), `search`, registry secret, auth tokens                 |
+| `DatastoreBackend`          | Datastore     | the registry state when `database` is `datastore` (default)                                   |
+| `PostgresBackend`           | PostgreSQL    | the registry state when `database: postgres`, plus the per-package lock                       |
 | `GoogleCloudStorageHandler` | Cloud Storage | `readPackage`, `savePackage`, `createPackage`, `deletePackage`, `readTarball`, `writeTarball` |
-| `StorageHelper`             | both          | holds the configured `Datastore` and `Storage` clients, builds object paths and queries       |
+| `StorageHelper`             | Cloud Storage | holds the configured `Storage` client, builds object paths                                    |
 
 ## Google Cloud requirements
 
@@ -55,6 +59,9 @@ which is where reads and writes of that package's files happen.
 | ------------------------------- | ----------------------------- | ----------------------------------------------------------------------------- |
 | Cloud Storage bucket            | tarballs and package metadata | `gsutil mb -p <project> gs://<bucket>`                                        |
 | Firestore **in Datastore mode** | registry state                | `gcloud firestore databases create --type=datastore-mode --location=<region>` |
+
+Firestore is only needed with the default `database: datastore`; with `database: postgres`
+you need a PostgreSQL >= 11 instance instead (see [Cloud SQL / PostgreSQL](#postgresql)).
 
 Datastore mode is not optional — the plugin uses the Datastore API (`@google-cloud/datastore`),
 not the Firestore native API. A project can only hold one Firestore database mode, so a
@@ -81,6 +88,9 @@ which the plugin never does.
 
 All Datastore queries filter on a single property (`name` on packages, `user` on tokens)
 or on none at all, so the **automatic indexes are enough — no `index.yaml` is required**.
+
+With `database: postgres` the `datastore.*` permissions are not needed; the registry state
+is reached with PostgreSQL credentials.
 
 ### Credentials
 
@@ -141,6 +151,40 @@ from a query carries its identifier in `key.name` and leaves `key.id` undefined,
 that deletes an entity must reuse the key it read rather than rebuild one from an id.
 
 The package kind is configurable with the `kind` option; `Secret` and `Token` are fixed.
+
+### PostgreSQL
+
+The tables live in `postgres.schema` (default `public`), and every identifier is escaped
+and every value is a bound parameter.
+
+| Table      | Key                     | Columns                                           | Holds               |
+| ---------- | ----------------------- | ------------------------------------------------- | ------------------- |
+| `packages` | `name`                  | `created_at`                                      | one row per package |
+| `secret`   | `id` (constrained to 1) | `value`                                           | the registry secret |
+| `tokens`   | `(username, key)`       | `token`, `readonly`, `cidr`, `created`, `updated` | auth tokens         |
+
+Behaviour worth knowing:
+
+- **Secret**: Verdaccio generates a secret in memory when it finds none. With several replicas
+  starting against an empty database that would give each its own secret, invalidating
+  each other's tokens. `getSecret` therefore creates the secret atomically
+  (`INSERT ... ON CONFLICT DO NOTHING`, then re-read), so every replica reads the same value.
+  `setSecret` never overwrites a stored secret.
+- **Migration**: at start-up the plugin takes `pg_advisory_xact_lock`, checks which tables
+  exist and creates only the missing ones, so concurrent replicas are safe and a role without
+  `CREATE` still starts once an admin has applied [`sql/schema.sql`](sql/schema.sql).
+- **Package lock**: `updatePackage` runs inside `pg_advisory_lock(hashtextextended(<schema>:package:<name>, 0))`
+  held on a dedicated connection, with `lock_timeout` bounding the wait. If the unlock fails
+  the connection is destroyed, which releases the lock server-side. A lock held by a replica that
+  crashes is released when the server notices its connection is gone; after a network
+  partition that can take the server's TCP keepalive time, during which waiters fail fast on
+  `lock_timeout` rather than hang. A holder whose update never finishes gives up after
+  `lockTimeoutMs` and releases the lock.
+- **Connections**: lock waiters use a second pool of the same `max` size, so queued
+  publishes on one hot package can never starve ordinary queries (tokens, search, secret); a
+  replica can therefore open up to `2 * max` connections. Size `max` for the expected
+  same-package contention; `statement_timeout` is `lockTimeoutMs + 30s` so no
+  statement hangs forever. Pool and connection errors are logged and never crash the process.
 
 ## Request flows
 
@@ -212,18 +256,23 @@ flowchart TB
     v1 --> gcs[("Cloud Storage")]
     v2 --> gcs
     v3 --> gcs
-    v1 --> ds[("Datastore")]
+    v1 --> ds[("Datastore or PostgreSQL")]
     v2 --> ds
     v3 --> ds
 ```
 
-All instances must share the same bucket, the same Datastore database and the same
-registry secret — the secret lives in Datastore, so that one is automatic.
+All instances must share the same bucket, the same registry database and the same
+registry secret — the secret lives in that database, so that one is automatic.
 
 Worth knowing before you rely on it: Verdaccio serialises concurrent writes to a package
-**within one process**. Two instances publishing different versions of the same package at
-the same moment are not serialised by this plugin, and the last writer wins on
-`package.json`.
+**within one process**. With **Datastore**, two instances publishing different versions of
+the same package at the same moment are not serialised by this plugin, and the last writer
+wins on `package.json`. With **PostgreSQL** the per-package advisory lock above serialises
+them across instances, so neither version is lost.
+
+Also not shared: the default `htpasswd` authentication keeps its file in each pod's local
+`/verdaccio/storage`. Use an external authentication plugin, or a shared htpasswd source,
+when running more than one replica.
 
 See the [Helm example](examples/helm/) for a Kubernetes deployment with Workload Identity.
 

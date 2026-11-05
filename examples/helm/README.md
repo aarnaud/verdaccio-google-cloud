@@ -128,10 +128,19 @@ kubectl delete -f init-resources.yaml
 kubectl delete -f emulators.yaml
 ```
 
+## High availability with PostgreSQL (production)
+
+[`values-postgres.yaml`](values-postgres.yaml) is a production-shaped example: GCS for bytes,
+PostgreSQL (for example Cloud SQL) for the registry state, no Datastore, three replicas spread
+over nodes, Workload Identity for GCS, and the connection string read from a Kubernetes Secret.
+Read the comments at the top of the file: the default `htpasswd` authentication is per pod, so
+replace it with an external provider before running more than one replica.
+
 ## File overview
 
-| File                  | Description                                                                            |
-| --------------------- | -------------------------------------------------------------------------------------- |
-| `values.yaml`         | Helm values for Verdaccio — 2 replicas, emulator endpoints, trace logging              |
-| `emulators.yaml`      | Deployment + Service for fake-gcs-server and Datastore emulator in their own namespace |
-| `init-resources.yaml` | Job that creates the GCS bucket in fake-gcs-server                                     |
+| File                   | Description                                                                            |
+| ---------------------- | -------------------------------------------------------------------------------------- |
+| `values.yaml`          | Helm values for Verdaccio — 2 replicas, emulator endpoints, trace logging              |
+| `values-postgres.yaml` | Helm values for HA on GKE — GCS + PostgreSQL, Workload Identity, anti-affinity         |
+| `emulators.yaml`       | Deployment + Service for fake-gcs-server and Datastore emulator in their own namespace |
+| `init-resources.yaml`  | Job that creates the GCS bucket in fake-gcs-server                                     |

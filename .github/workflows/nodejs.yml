@@ -17,6 +17,20 @@ jobs:
   build:
     runs-on: ubuntu-latest
     if: github.event.pull_request.draft == false
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: verdaccio
+          POSTGRES_PASSWORD: verdaccio
+          POSTGRES_DB: verdaccio_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U verdaccio -d verdaccio_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -47,6 +61,8 @@ jobs:
 
       - name: Test
         run: pnpm test
+        env:
+          TEST_POSTGRES_URL: postgres://verdaccio:verdaccio@localhost:5432/verdaccio_test
 
       - name: Verify ESM output
         run: |
@@ -60,9 +76,16 @@ jobs:
           "
 
   docker:
+    name: docker (${{ matrix.database }})
     runs-on: ubuntu-latest
     needs: build
     if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        database: [datastore, postgres]
+    env:
+      COMPOSE_FILE: ${{ matrix.database == 'postgres' && 'docker-compose.yaml:docker-compose.postgres.yaml' || 'docker-compose.yaml' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -115,7 +138,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
-          name: cypress-artifacts
+          name: cypress-artifacts-${{ matrix.database }}
           path: |
             cypress/videos
             cypress/screenshots

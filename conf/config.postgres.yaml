@@ -1,0 +1,35 @@
+# Same as config.yaml but keeps registry state in PostgreSQL instead of Datastore.
+# Used by docker-compose.postgres.yaml and the CI e2e run.
+storage: /verdaccio/storage
+
+plugins: /verdaccio/plugins
+
+max_body_size: 100mb
+
+store:
+  google-cloud:
+    bucket: GCS_BUCKET
+    projectId: GOOGLE_CLOUD_PROJECT
+    apiEndpoint: GCS_API_ENDPOINT
+    database: postgres
+    postgres:
+      # value is the NAME of an environment variable, like the other options
+      connectionString: DATABASE_URL
+
+packages:
+  '@*/*':
+    access: $all
+    publish: $all
+  '**':
+    access: $all
+    publish: $all
+
+log:
+  - {type: stdout, format: pretty, level: trace}
+
+listen:
+  - 0.0.0.0:4873
+
+auth:
+  htpasswd:
+    file: /verdaccio/storage/htpasswd

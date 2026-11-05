@@ -124,6 +124,24 @@ describe('Google Cloud Database', () => {
       });
     });
 
+    test('only the postgres backend hands a package locker to the storage handler', () => {
+      const datastoreDb = getCloudDatabase();
+      expect((datastoreDb.getPackageStorage('p') as any).locker).toBeUndefined();
+
+      const postgresDb = getCloudDatabase({
+        ...storageConfig,
+        database: 'postgres',
+        postgres: {connectionString: 'postgres://u:p@localhost:5432/x'},
+      } as any);
+      expect((postgresDb.getPackageStorage('p') as any).locker).toBeDefined();
+    });
+
+    test('rejects an unknown database', () => {
+      expect(() => getCloudDatabase({...storageConfig, database: 'mongo'} as any)).toThrow(
+        /unknown database/
+      );
+    });
+
     test('should get a package storage instance', () => {
       const cloudDatabase = getCloudDatabase();
       const store = cloudDatabase.getPackageStorage('newInstance');
@@ -161,12 +179,8 @@ describe('Google Cloud Database', () => {
     // Returning the bare {name, path, time} shape made /-/v1/search answer 500.
     test('returns SearchItem objects with a package wrapper', async () => {
       const cloudDatabase = getCloudDatabase();
-      (cloudDatabase as any).helper = {
-        getEntities: () =>
-          Promise.resolve([
-            {name: 'alpha-pkg', key: {}},
-            {name: 'beta-pkg', key: {}},
-          ]),
+      (cloudDatabase as any).backend = {
+        listPackages: () => Promise.resolve(['alpha-pkg', 'beta-pkg']),
       };
 
       const items = await cloudDatabase.search({text: 'alpha'} as any);
@@ -180,12 +194,8 @@ describe('Google Cloud Database', () => {
     // Missing the text meant matching everything, which timed the endpoint out.
     test('also reads the text when the query arrives wrapped', async () => {
       const cloudDatabase = getCloudDatabase();
-      (cloudDatabase as any).helper = {
-        getEntities: () =>
-          Promise.resolve([
-            {name: 'alpha-pkg', key: {}},
-            {name: 'beta-pkg', key: {}},
-          ]),
+      (cloudDatabase as any).backend = {
+        listPackages: () => Promise.resolve(['alpha-pkg', 'beta-pkg']),
       };
 
       const items = await cloudDatabase.search({query: {text: 'beta'}} as any);
@@ -199,8 +209,8 @@ describe('Google Cloud Database', () => {
     // onEnd left the request hanging until the client aborted (50s/90s timeouts).
     test('callback pattern emits SearchItem and always ends', async () => {
       const cloudDatabase = getCloudDatabase();
-      (cloudDatabase as any).helper = {
-        getEntities: () => Promise.resolve([{name: 'alpha-pkg', key: {}}]),
+      (cloudDatabase as any).backend = {
+        listPackages: () => Promise.resolve(['alpha-pkg']),
       };
 
       const seen: any[] = [];
@@ -220,12 +230,8 @@ describe('Google Cloud Database', () => {
 
     test('callback pattern honours the validateName predicate', async () => {
       const cloudDatabase = getCloudDatabase();
-      (cloudDatabase as any).helper = {
-        getEntities: () =>
-          Promise.resolve([
-            {name: 'alpha-pkg', key: {}},
-            {name: 'beta-pkg', key: {}},
-          ]),
+      (cloudDatabase as any).backend = {
+        listPackages: () => Promise.resolve(['alpha-pkg', 'beta-pkg']),
       };
 
       const seen: string[] = [];
@@ -245,8 +251,8 @@ describe('Google Cloud Database', () => {
 
     test('callback pattern ends even when the datastore fails', async () => {
       const cloudDatabase = getCloudDatabase();
-      (cloudDatabase as any).helper = {
-        getEntities: () => Promise.reject(new Error('datastore down')),
+      (cloudDatabase as any).backend = {
+        listPackages: () => Promise.reject(new Error('datastore down')),
       };
 
       const err = await new Promise<any>((resolve) => {
@@ -271,5 +277,36 @@ describe('Google Cloud Database', () => {
       const cloudDatabase = getCloudDatabase();
       await cloudDatabase.init();
     });
+  });
+});
+
+describe('postgres config logging', () => {
+  test('never writes the connection string or password to the debug output', async () => {
+    const written: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: any) => {
+      written.push(String(chunk));
+      return true;
+    });
+    const debugLib = (await import('debug')).default;
+    debugLib.enable('verdaccio:plugin:google-cloud:config');
+    process.env.TEST_PG_URL = 'postgres://u:hunter2@db:5432/x';
+    try {
+      const {default: Database} = await import('../src/data-storage');
+      new Database(
+        {
+          bucket: 'b',
+          database: 'postgres',
+          postgres: {connectionString: 'TEST_PG_URL', password: 'hunter2-literal'},
+        } as any,
+        {logger: createLogger(), config: {} as any}
+      );
+    } finally {
+      debugLib.disable();
+      spy.mockRestore();
+      delete process.env.TEST_PG_URL;
+    }
+    const output = written.join('');
+    expect(output).toContain('TEST_PG_URL');
+    expect(output).not.toContain('hunter2');
   });
 });
